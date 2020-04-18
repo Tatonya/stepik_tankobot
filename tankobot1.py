@@ -36,7 +36,7 @@ else:
             "def": {}
         }
     else:
-        data = json.load(raw_data)
+        data = json.loads(raw_data)
 
 
 def change_data(key, user_id, value):
