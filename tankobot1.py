@@ -8,6 +8,8 @@ For a description of the Bot API, see this page: https://core.telegram.org/bots/
 import telebot
 import requests
 import json
+import os
+import redis
 
 token = '1125523623:AAFqJKIVDwJVGqy6d-TDNxBSkaliXJjiawU'
 bot = telebot.TeleBot(token)
@@ -16,21 +18,51 @@ MAIN_STATE = 'main'
 ASKING_QUESTION = 'asking_question'
 LETTERS = ("ц", "у", "к", "е", "н", "г", "ш", "щ", "з", "а"
            , "х", "ф", "в", "п", "р", "о", "л", "д", "ж", "э", "ч", "с", "м", "и", "т", "б")
-try:
-    data = json.load(open('tankobot_data.json', 'r', encoding='utf-8'))
-except FileNotFoundError:
-    data = {
-        "states": {},
-        "question": {},
-        "first_letter": {},
-        "vic": {},
-        "def": {}
-    }
+redis_url = os.environ.get('REDIS_URL')
+if redis_url is None:
+
+    try:
+        data = json.load(open('tankobot_data.json', 'r', encoding='utf-8'))
+    except FileNotFoundError:
+        data = {
+            "states": {},
+            "question": {},
+            "first_letter": {},
+            "vic": {},
+            "def": {}
+        }
+else:
+    redis_db=redis.from_url(redis_url)
+    raw_data=redis_db.get('data')
+    if raw_data is None:
+        data = {
+            "states": {},
+            "question": {},
+            "first_letter": {},
+            "vic": {},
+            "def": {}
+        }
+    else:
+        data=json.load(raw_data)
 
 
 def change_data(key, user_id, value):
     data[key][user_id] = value
-    json.dump(data, open('tankobot_data.json', 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
+    if redis_url is None:
+        json.dump(data, open('tankobot_data.json', 'w', encoding='utf-8'), indent=2, ensure_ascii=False)
+    else:
+        redis_db = redis.from_url(redis_url)
+        redis_db.set('data',json.dumps(data))
+
+
+def choose_and_send_question(func_letter, func_user_id):
+    '''меняет состояние бота на ASKING_QUESTION, выбирает слово и отправляет вопрос пользователю'''
+    change_data('states', func_user_id, ASKING_QUESTION)
+    change_data('question', func_user_id, requests.get(
+        api_url, params={'first_letter': func_letter}
+    ).json()['word'])
+    ask = 'На какую букву нужно поставить ударение в слове "{}" ?'.format(data['question'][func_user_id].lower())
+    bot.send_message(func_user_id, ask)
 
 
 @bot.message_handler(func=lambda message: True)
@@ -58,6 +90,7 @@ def main_handler(message):
                              "                         Отменить выбор буквы - отправьте \"На любую букву\"\n"
                              "                         Посмотреть счет - отправьте \"Покажи счет\"\n"
                              "                         \n"
+                             "Сбросить счёт и выбор буквы - отправьте \"Заново\"\n"
                              "                         "))
     elif message.text.lower() == 'привет':
         bot.send_message(user_id, "Ну привет!")
@@ -65,34 +98,27 @@ def main_handler(message):
         letter = message.text.lower()[-1]
         bot.send_message(user_id, 'Хорошо, спрашиваю слова на букву {}.'.format(letter))
         change_data('first_letter', user_id, letter)
-        change_data('states', user_id, ASKING_QUESTION)
-        change_data('question', user_id, requests.get(
-            api_url, params={'first_letter': letter}
-        ).json()['word'])
-        ask = 'На какую букву нужно поставить ударение в слове "{}" ?'.format(data['question'][user_id].lower())
-        bot.send_message(user_id, ask)
+        choose_and_send_question(letter, user_id)
     elif message.text.lower() == 'на любую букву':
         bot.send_message(user_id, 'Хорошо, спрашиваю слова на любую букву')
-        change_data('first_letter', user_id, None)
-        change_data('states', user_id, ASKING_QUESTION)
-        letter = data['first_letter'].get(user_id)
-        change_data('question', user_id, requests.get(
-            api_url, params={'first_letter': letter}
-        ).json()['word'])
-        ask = 'На какую букву нужно поставить ударение в слове "{}" ?'.format(data['question'][user_id].lower())
-        bot.send_message(user_id, ask)
+        letter = None
+        change_data('first_letter', user_id, letter)
+        choose_and_send_question(letter, user_id)
     elif message.text.lower() == 'спроси меня слово':
         letter = data['first_letter'].get(user_id)
-        change_data('question', user_id, requests.get(
-            api_url, params={'first_letter': letter}
-        ).json()['word'])
-        ask = 'На какую букву нужно поставить ударение в слове "{}" ?'.format(data['question'][user_id].lower())
-        bot.send_message(user_id, ask)
-        change_data('states', user_id, ASKING_QUESTION)
+        choose_and_send_question(letter, user_id)
+
 
     elif message.text.lower() == 'покажи счет':
         bot.send_message(user_id,
                          "Верно {}\tОшибок {}".format(data['vic'][user_id], data['def'][user_id]))
+        change_data('states', user_id, MAIN_STATE)
+    elif message.text.lower() == 'заново':
+        bot.send_message(user_id,
+                         "Хорошо, начнём сначала. ")
+        change_data('vic', user_id, 0)
+        change_data('def', user_id, 0)
+        change_data('first_letter', user_id, None)
         change_data('states', user_id, MAIN_STATE)
 
     else:
@@ -101,6 +127,7 @@ def main_handler(message):
 
 
 def asking_question(message):
+    '''Сравнивает ответ пользователя с вопросом, хвалит/ругает, начисляет очки'''
     user_id = str(message.from_user.id)
     if message.text == data['question'][user_id]:
         bot.send_message(user_id, "Правильно!")
@@ -117,4 +144,3 @@ def asking_question(message):
 
 bot.polling()
 
-print('Бот остановлен. Можно сохранить данные на диск')
